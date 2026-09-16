@@ -17,7 +17,8 @@ type TestConfig struct {
 	wg          *sync.WaitGroup
 }
 
-func DialServer() {
+func DialServer(tc *TestConfig) {
+	defer tc.wg.Done()
 	dialer := websocket.Dialer{}
 
 	conn, _, err := dialer.Dial(fmt.Sprintf("%s%s", host, WSport), nil)
@@ -25,40 +26,22 @@ func DialServer() {
 		log.Fatalf("Error on connection: %s\n", err)
 	}
 	defer conn.Close()
-
-	time.Sleep(time.Second)
 }
 
 func TestConnection(t *testing.T) {
 	go CreateWSServer()
-	time.Sleep(time.Second)
+	clientCount := 5
 
-	tc := TestConfig{clientCount: 5, wg: &sync.WaitGroup{}}
-
-	for range tc.clientCount {
-		tc.wg.Go(DialServer)
+	tc := TestConfig{clientCount: clientCount, wg: &sync.WaitGroup{}}
+	tc.wg.Add(clientCount)
+	for range clientCount {
+		go func() {
+			DialServer(&tc)
+		}()
 	}
 
 	tc.wg.Wait()
+	time.Sleep(time.Second)
+
 	fmt.Println("exiting test")
-}
-
-type MyError struct{ msg string }
-
-func (e *MyError) Error() string { return e.msg }
-
-func doSomething() error {
-	var err *MyError
-	// ...
-	if err != nil {
-		return err
-	}
-	return nil // explicit, not a typed nil in disguise
-}
-
-func doer() {
-	err := doSomething()
-	if err != nil {
-		log.Println("failed:", err) // this runs, even though err "is nil"
-	}
 }
