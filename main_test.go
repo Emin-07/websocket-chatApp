@@ -18,14 +18,17 @@ type TestConfig struct {
 }
 
 func DialServer(tc *TestConfig) {
-	defer tc.wg.Done()
 	dialer := websocket.Dialer{}
 
 	conn, _, err := dialer.Dial(fmt.Sprintf("%s%s", host, WSport), nil)
 	if err != nil {
 		log.Fatalf("Error on connection: %s\n", err)
 	}
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		tc.wg.Done()
+	}()
+
 }
 
 func TestConnection(t *testing.T) {
