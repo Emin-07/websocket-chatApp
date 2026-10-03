@@ -1,9 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,36 +17,94 @@ import (
 const host = "ws://localhost"
 
 type TestConfig struct {
-	clientCount int
-	wg          *sync.WaitGroup
+	clientCount    int
+	wg             *sync.WaitGroup
+	brMsgCount     *atomic.Int64
+	targetMsgCount int
+	sendsDone      *atomic.Bool
 }
 
-func DialServer(tc *TestConfig) {
+func DialServer(tc *TestConfig) *websocket.Conn {
+	exit := make(chan struct{})
 	dialer := websocket.Dialer{}
 
 	conn, _, err := dialer.Dial(fmt.Sprintf("%s%s", host, WSport), nil)
 	if err != nil {
 		log.Fatalf("Error on connection: %s\n", err)
 	}
-	defer func() {
+
+	go func() {
+		for {
+			time.Sleep(time.Second * 2)
+			if tc.sendsDone.Load() && tc.targetMsgCount >= int(tc.brMsgCount.Load()) {
+				exit <- struct{}{}
+				return
+			}
+		}
+	}()
+
+	go func() {
+		<-exit
 		conn.Close()
 		tc.wg.Done()
 	}()
 
+	go func() {
+		for {
+			_, b, err := conn.ReadMessage()
+			if err != nil {
+				if !errors.Is(err, net.ErrClosed) &&
+					!strings.Contains(err.Error(), "use of closed network connection") {
+					fmt.Printf("error reading a message: %v\n", err)
+				}
+				return
+			}
+			if len(b) > 0 {
+				tc.brMsgCount.Add(1)
+			}
+		}
+	}()
+	return conn
 }
 
 func TestConnection(t *testing.T) {
 	go CreateWSServer()
-	clientCount := 5
+	time.Sleep(time.Millisecond * 100)
 
-	tc := TestConfig{clientCount: clientCount, wg: &sync.WaitGroup{}}
-	tc.wg.Add(clientCount)
+	clientCount := 5
+	brCount := 3
+	target := clientCount * brCount
+
+	tc := &TestConfig{clientCount: clientCount, wg: &sync.WaitGroup{},
+		brMsgCount: &atomic.Int64{}, targetMsgCount: target, sendsDone: &atomic.Bool{}}
+
+	tc.sendsDone.Store(false)
+
+	tc.wg.Add(clientCount + 1)
+
+	brClient := DialServer(tc)
+
 	for range clientCount {
 		go func() {
-			DialServer(&tc)
+			DialServer(tc)
 		}()
 	}
 
+	time.Sleep(time.Second)
+
+	for range brCount {
+		msg := &ReqMsg{
+			MsgType: BroadCastMsg,
+			Data:    "Hello from tests",
+		}
+		time.Sleep(time.Millisecond * 100)
+		err := brClient.WriteJSON(msg)
+		if err != nil {
+			fmt.Printf("error writing message: %v\n", err)
+			return
+		}
+	}
+	tc.sendsDone.Swap(true)
 	tc.wg.Wait()
 	time.Sleep(time.Second)
 

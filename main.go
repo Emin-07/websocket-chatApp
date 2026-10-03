@@ -38,24 +38,41 @@ func NewRespMsg(msg *ReqMsg) *RespMsg {
 }
 
 type Client struct {
-	ID   string
-	mu   *sync.RWMutex
-	conn *websocket.Conn
+	ID    string
+	mu    *sync.RWMutex
+	conn  *websocket.Conn
+	msgCH chan *RespMsg
+	done  chan struct{}
 }
 
 func NewClient(conn *websocket.Conn) *Client {
 	return &Client{
-		ID:   rand.Text()[:9],
-		mu:   &sync.RWMutex{},
-		conn: conn,
+		ID:    rand.Text()[:9],
+		mu:    &sync.RWMutex{},
+		conn:  conn,
+		msgCH: make(chan *RespMsg, 64),
+		done:  make(chan struct{}),
+	}
+}
+
+func (c *Client) writeMsgLoop() {
+	defer c.conn.Close()
+	for {
+		select {
+		case <-c.done:
+			return
+		case msg := <-c.msgCH:
+			if err := c.conn.WriteJSON(msg); err != nil {
+				fmt.Printf("error sending msg to clientID = %s\n", c.ID)
+				return
+			}
+		}
 	}
 }
 
 func (c *Client) readMsgLoop(leaveServerCH chan<- *Client, broadCastCH chan<- *ReqMsg) {
 	defer func() {
-		if err := c.conn.Close(); err != nil {
-			fmt.Println(err)
-		}
+		close(c.done)
 		leaveServerCH <- c
 	}()
 
@@ -69,6 +86,8 @@ func (c *Client) readMsgLoop(leaveServerCH chan<- *Client, broadCastCH chan<- *R
 			fmt.Println(err)
 			continue
 		}
+
+		msg.Client = c
 
 		broadCastCH <- msg
 	}
@@ -104,7 +123,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	client := NewClient(conn)
 	s.joinServerCH <- client
 
-	client.readMsgLoop(s.leaveServerCH, s.broadCastCH)
+	go client.writeMsgLoop()
+	go client.readMsgLoop(s.leaveServerCH, s.broadCastCH)
 
 }
 
@@ -116,7 +136,13 @@ func (s *Server) AcceptLoop(ctx context.Context) {
 		case c := <-s.leaveServerCH:
 			s.leaveServer(c)
 		case msg := <-s.broadCastCH:
-			go s.broadcast(msg)
+			cls := make(map[string]*Client, len(s.clients)-1)
+			for id, client := range s.clients {
+				if msg.Client.ID != id {
+					cls[id] = client
+				}
+			}
+			go s.broadcast(msg, cls)
 		case <-ctx.Done():
 			return
 		}
@@ -124,33 +150,23 @@ func (s *Server) AcceptLoop(ctx context.Context) {
 }
 
 func (s *Server) joinServer(c *Client) {
+	s.mu.Lock()
 	s.clients[c.ID] = c
+	s.mu.Unlock()
 	fmt.Printf("client %s joined the server\n", c.ID)
 }
 
 func (s *Server) leaveServer(c *Client) {
+	s.mu.Lock()
 	delete(s.clients, c.ID)
+	s.mu.Unlock()
 	fmt.Printf("client %s left the server\n", c.ID)
 }
-func (s *Server) broadcast(msg *ReqMsg) {
-	var cls = make([]*Client, len(s.clients)-1)
 
-	i := 0
-	s.mu.RLock()
-	for _, c := range s.clients {
-		if c.ID != msg.Client.ID {
-			cls[i] = c
-		}
-		i++
-	}
-	s.mu.RUnlock()
-
+func (s *Server) broadcast(msg *ReqMsg, cls map[string]*Client) {
 	resp := NewRespMsg(msg)
 	for _, c := range cls {
-		if err := c.conn.WriteJSON(resp); err != nil {
-			fmt.Printf("error sending msg to clientID = %s\n", c.ID)
-			continue
-		}
+		c.msgCH <- resp
 	}
 
 	fmt.Println("broadcast was sent")
