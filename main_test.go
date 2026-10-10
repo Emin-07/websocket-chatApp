@@ -24,6 +24,36 @@ type TestConfig struct {
 	sendsDone      *atomic.Bool
 }
 
+type TestClient struct {
+	conn  *websocket.Conn
+	msgCh chan *ReqMsg
+	done  chan struct{}
+}
+
+func NewTestClient(conn *websocket.Conn) *TestClient {
+	return &TestClient{
+		conn:  conn,
+		msgCh: make(chan *ReqMsg, 64),
+		done:  make(chan struct{}),
+	}
+}
+
+func (tc *TestClient) writeLoop() {
+	for {
+		select {
+		case <-tc.done:
+			return
+		case msg := <-tc.msgCh:
+			time.Sleep(time.Millisecond * 100)
+			err := tc.conn.WriteJSON(msg)
+			if err != nil {
+				fmt.Printf("error writing message: %v\n", err)
+				return
+			}
+		}
+	}
+}
+
 func DialServer(tc *TestConfig) *websocket.Conn {
 	exit := make(chan struct{})
 	dialer := websocket.Dialer{}
@@ -82,12 +112,13 @@ func TestConnection(t *testing.T) {
 
 	tc.wg.Add(clientCount + 1)
 
-	brClient := DialServer(tc)
+	brConn := DialServer(tc)
+	brClient := NewTestClient(brConn)
+
+	go brClient.writeLoop()
 
 	for range clientCount {
-		go func() {
-			DialServer(tc)
-		}()
+		go DialServer(tc)
 	}
 
 	time.Sleep(time.Second)
@@ -97,16 +128,14 @@ func TestConnection(t *testing.T) {
 			MsgType: BroadCastMsg,
 			Data:    "Hello from tests",
 		}
-		time.Sleep(time.Millisecond * 100)
-		err := brClient.WriteJSON(msg)
-		if err != nil {
-			fmt.Printf("error writing message: %v\n", err)
-			return
-		}
+
+		brClient.msgCh <- msg
 	}
 	tc.sendsDone.Swap(true)
-	tc.wg.Wait()
-	time.Sleep(time.Second)
 
+	tc.wg.Wait()
+	brClient.done <- struct{}{}
+
+	time.Sleep(time.Second)
 	fmt.Println("exiting test")
 }
