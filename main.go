@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -12,17 +11,22 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const WSport = ":3223"
+var (
+	WSPort = ":3223"
+)
 
 type MsgType string
 
-const BroadCastMsg MsgType = "broadcast"
+const (
+	MsgtypeBroadcast MsgType = "broadcast"
+)
 
 type ReqMsg struct {
 	MsgType MsgType
 	Client  *Client
 	Data    string
 }
+
 type RespMsg struct {
 	MsgType  MsgType
 	Data     string
@@ -46,13 +50,15 @@ type Client struct {
 }
 
 func NewClient(conn *websocket.Conn) *Client {
+	ID := rand.Text()[:9]
 	return &Client{
-		ID:    rand.Text()[:9],
-		mu:    &sync.RWMutex{},
+		ID:    ID,
+		mu:    new(sync.RWMutex),
 		conn:  conn,
 		msgCH: make(chan *RespMsg, 64),
 		done:  make(chan struct{}),
 	}
+
 }
 
 func (c *Client) writeMsgLoop() {
@@ -62,7 +68,8 @@ func (c *Client) writeMsgLoop() {
 		case <-c.done:
 			return
 		case msg := <-c.msgCH:
-			if err := c.conn.WriteJSON(msg); err != nil {
+			err := c.conn.WriteJSON(msg)
+			if err != nil {
 				fmt.Printf("error sending msg to clientID = %s\n", c.ID)
 				return
 			}
@@ -70,10 +77,10 @@ func (c *Client) writeMsgLoop() {
 	}
 }
 
-func (c *Client) readMsgLoop(leaveServerCH chan<- *Client, broadCastCH chan<- *ReqMsg) {
+func (c *Client) readMsgLoop(srv *Server) {
 	defer func() {
 		close(c.done)
-		leaveServerCH <- c
+		srv.leaveServerCH <- c
 	}()
 
 	for {
@@ -81,15 +88,16 @@ func (c *Client) readMsgLoop(leaveServerCH chan<- *Client, broadCastCH chan<- *R
 		if err != nil {
 			return
 		}
-		msg := &ReqMsg{}
-		if err = json.Unmarshal(b, &msg); err != nil {
-			fmt.Println(err)
+
+		msg := new(ReqMsg)
+		err = json.Unmarshal(b, msg)
+		if err != nil {
+			fmt.Printf("unable to unmarshal the msg %v\n", err)
 			continue
 		}
-
 		msg.Client = c
 
-		broadCastCH <- msg
+		srv.broadcastCH <- msg
 	}
 }
 
@@ -98,25 +106,31 @@ type Server struct {
 	mu            *sync.RWMutex
 	joinServerCH  chan *Client
 	leaveServerCH chan *Client
-	broadCastCH   chan *ReqMsg
+	broadcastCH   chan *ReqMsg
 }
 
 func NewServer() *Server {
 	return &Server{
-		clients:       make(map[string]*Client),
-		mu:            &sync.RWMutex{},
+		clients:       map[string]*Client{},
+		mu:            new(sync.RWMutex),
 		joinServerCH:  make(chan *Client, 64),
 		leaveServerCH: make(chan *Client, 64),
-		broadCastCH:   make(chan *ReqMsg, 64),
+		broadcastCH:   make(chan *ReqMsg, 64),
 	}
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	upgrader := websocket.Upgrader{ReadBufferSize: 512, WriteBufferSize: 512, CheckOrigin: func(r *http.Request) bool { return true }}
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  512,
+		WriteBufferSize: 512,
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		fmt.Printf("Error on HTTP conn upgrade : %s\n", err)
+		fmt.Printf("Error on HTTP conn upgrade %v\n", err)
 		return
 	}
 
@@ -124,43 +138,36 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.joinServerCH <- client
 
 	go client.writeMsgLoop()
-	go client.readMsgLoop(s.leaveServerCH, s.broadCastCH)
-
+	go client.readMsgLoop(s)
 }
 
-func (s *Server) AcceptLoop(ctx context.Context) {
+func (s *Server) AcceptLoop() {
 	for {
 		select {
 		case c := <-s.joinServerCH:
 			s.joinServer(c)
 		case c := <-s.leaveServerCH:
 			s.leaveServer(c)
-		case msg := <-s.broadCastCH:
-			cls := make(map[string]*Client, len(s.clients)-1)
-			for id, client := range s.clients {
-				if msg.Client.ID != id {
-					cls[id] = client
+		case msg := <-s.broadcastCH:
+			cls := map[string]*Client{}
+			for id, c := range s.clients {
+				if id != msg.Client.ID {
+					cls[id] = c
 				}
 			}
 			go s.broadcast(msg, cls)
-		case <-ctx.Done():
-			return
 		}
 	}
 }
 
 func (s *Server) joinServer(c *Client) {
-	s.mu.Lock()
 	s.clients[c.ID] = c
-	s.mu.Unlock()
-	fmt.Printf("client %s joined the server\n", c.ID)
+	fmt.Printf("client joined the server, cID = %s\n", c.ID)
 }
 
 func (s *Server) leaveServer(c *Client) {
-	s.mu.Lock()
 	delete(s.clients, c.ID)
-	s.mu.Unlock()
-	fmt.Printf("client %s left the server\n", c.ID)
+	fmt.Printf("client left the server, cID = %s\n", c.ID)
 }
 
 func (s *Server) broadcast(msg *ReqMsg, cls map[string]*Client) {
@@ -172,17 +179,27 @@ func (s *Server) broadcast(msg *ReqMsg, cls map[string]*Client) {
 	fmt.Println("broadcast was sent")
 }
 
-func CreateWSServer() {
-	srv := NewServer()
-	srvCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func createWSServer() {
+	s := NewServer()
+	go s.AcceptLoop()
+	http.HandleFunc("/", s.handleWS)
 
-	go srv.AcceptLoop(srvCtx)
-	http.HandleFunc("/", srv.handleWS)
-
-	fmt.Printf("server started at port: %s\n", WSport)
-	log.Fatal(http.ListenAndServe(WSport, nil))
+	fmt.Printf("starting server on port: %s\n", WSPort)
+	log.Fatal(http.ListenAndServe(WSPort, nil))
 }
+
+// TODO
+// [x] HTTP server
+// [x] Upgrade it to WS once client connects
+// [x] Add WS client
+// [x] Add newly connected ws to server
+// [x] Remove client on disconnect
+// [x] Send broadcast msg -> no race conditions
+// [] join room
+// [] leave room
+// [] Send room msg -> no race conditions
+// [] meamory leakage -> grafana/prom
+// [] test performance
 func main() {
-	CreateWSServer()
+	createWSServer()
 }
